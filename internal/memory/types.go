@@ -21,26 +21,13 @@ type DumpResult struct {
 	OutputPath  string `json:"output_path,omitempty"`
 }
 
-// ScanOptions configures memory scanning
-type ScanOptions struct {
-	PID           int32  `json:"pid"`
-	ScanSecrets   bool   `json:"scan_secrets"`
-	ScanInjection bool   `json:"scan_injection"`
-	ScanStrings   bool   `json:"scan_strings"`
-	YaraRulesPath string `json:"yara_rules_path,omitempty"`
-}
-
-// ScanResult represents memory scan results
-type ScanResult struct {
-	PID            int32            `json:"pid"`
-	ProcessName    string           `json:"process_name"`
-	BytesScanned   uint64           `json:"bytes_scanned"`
-	RegionsScanned int              `json:"regions_scanned"`
-	Secrets        []SecretMatch    `json:"secrets,omitempty"`
-	Injections     []InjectionMatch `json:"injections,omitempty"`
-	Strings        []string         `json:"strings,omitempty"`
-	YaraMatches    []YaraMatch      `json:"yara_matches,omitempty"`
-	ThreatScore    int              `json:"threat_score"`
+// NetworkConnection represents an open network connection
+type NetworkConnection struct {
+	LocalAddr  string `json:"local_addr"`
+	RemoteAddr string `json:"remote_addr"`
+	State      string `json:"state"`
+	Protocol   string `json:"protocol"` // TCP/UDP
+	FD         int32  `json:"fd"`
 }
 
 // SecretMatch represents a found secret/credential
@@ -49,6 +36,42 @@ type SecretMatch struct {
 	Value      string `json:"value"`
 	Offset     uint64 `json:"offset"`
 	Confidence int    `json:"confidence"` // 0-100
+}
+
+// WalletMatch represents a potentially found crypto wallet address
+type WalletMatch struct {
+	Type    string `json:"type"` // BTC, ETH, SOL
+	Address string `json:"address"`
+}
+
+// ScanOptions configures memory scanning
+type ScanOptions struct {
+	PID           int32  `json:"pid"`
+	ScanSecrets   bool   `json:"scan_secrets"`
+	ScanInjection bool   `json:"scan_injection"`
+	ScanStrings   bool   `json:"scan_strings"`
+	ScanPatterns  bool   `json:"scan_patterns"` // Enable regex for emails, IPs, etc.
+	ScanNetwork   bool   `json:"scan_network"`
+	YaraRulesPath string `json:"yara_rules_path,omitempty"`
+}
+
+// ScanResult represents memory scan results
+type ScanResult struct {
+	PID            int32               `json:"pid"`
+	ProcessName    string              `json:"process_name"`
+	BytesScanned   uint64              `json:"bytes_scanned"`
+	RegionsScanned int                 `json:"regions_scanned"`
+	Secrets        []SecretMatch       `json:"secrets,omitempty"`
+	Injections     []InjectionMatch    `json:"injections,omitempty"`
+	Strings        []string            `json:"strings,omitempty"`
+	Emails         []string            `json:"emails,omitempty"`
+	Domains        []string            `json:"domains,omitempty"`
+	IPs            []string            `json:"ips,omitempty"`
+	JSONs          []string            `json:"jsons,omitempty"`
+	Wallets        []WalletMatch       `json:"wallets,omitempty"`
+	Network        []NetworkConnection `json:"network,omitempty"`
+	YaraMatches    []YaraMatch         `json:"yara_matches,omitempty"`
+	ThreatScore    int                 `json:"threat_score"`
 }
 
 // InjectionMatch represents a code injection indicator

@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,7 +14,30 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var servePort int
+// authMiddleware enforces bearer token authentication on all routes except /health.
+// Read token from ADS_MEMORY_API_TOKEN env var, or a randomly generated token
+// printed to stderr at startup.
+func authMiddleware(token string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if auth != "Bearer "+token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+var (
+	servePort    int
+	serveCert    string
+	serveKey     string
+	serveInsecure bool
+)
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -30,6 +55,40 @@ Requires root privileges for scan and dump operations.
 
 This mode is used by the ADS Security Console GUI.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Resolve API token: env var takes precedence, else generate random one.
+		apiToken := os.Getenv("ADS_MEMORY_API_TOKEN")
+		if apiToken == "" {
+			buf := make([]byte, 16)
+			if _, err := rand.Read(buf); err != nil {
+				return fmt.Errorf("failed to generate API token: %w", err)
+			}
+			apiToken = hex.EncodeToString(buf)
+			fmt.Fprintf(os.Stderr, "ADS_MEMORY_API_TOKEN=%s\n", apiToken)
+		}
+
+		// Check environment variables as fallback
+		if serveCert == "" {
+			if envCert := os.Getenv("TLS_CERT_PATH"); envCert != "" {
+				serveCert = envCert
+			}
+		}
+		if serveKey == "" {
+			if envKey := os.Getenv("TLS_KEY_PATH"); envKey != "" {
+				serveKey = envKey
+			}
+		}
+		if os.Getenv("TLS_ENABLED") == "false" {
+			serveInsecure = true
+		}
+
+		// Validate TLS config
+		tlsEnabled := !serveInsecure
+		if tlsEnabled && (serveCert == "" || serveKey == "") {
+			fmt.Fprintln(os.Stderr, "Error: TLS enabled but --cert and --key not specified")
+			fmt.Fprintln(os.Stderr, "Use --insecure to disable TLS (not recommended for production)")
+			return fmt.Errorf("TLS configuration required")
+		}
+
 		mux := http.NewServeMux()
 
 		// Health check
@@ -127,17 +186,33 @@ This mode is used by the ADS Security Console GUI.`,
 		})
 
 		addr := fmt.Sprintf("127.0.0.1:%d", servePort)
-		fmt.Printf("ADS Memory Forensics API server starting on http://%s\n", addr)
+		protocol := "http"
+		if tlsEnabled {
+			protocol = "https"
+		}
+		fmt.Printf("ADS Memory Forensics API server starting on %s://%s\n", protocol, addr)
 		fmt.Println("Endpoints: /health, /info, /regions, /scan, /dump")
+		if tlsEnabled {
+			fmt.Println("TLS: enabled")
+		} else {
+			fmt.Println("WARNING: TLS disabled - connections are not encrypted!")
+		}
 		if os.Geteuid() != 0 {
 			fmt.Println("WARNING: Not running as root - scan/dump operations will fail")
 		}
 
-		return http.ListenAndServe(addr, mux)
+		handler := authMiddleware(apiToken, mux)
+		if tlsEnabled {
+			return http.ListenAndServeTLS(addr, serveCert, serveKey, handler)
+		}
+		return http.ListenAndServe(addr, handler)
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(serveCmd)
 	serveCmd.Flags().IntVarP(&servePort, "port", "p", 9002, "Port to listen on")
+	serveCmd.Flags().StringVar(&serveCert, "cert", "", "TLS certificate file")
+	serveCmd.Flags().StringVar(&serveKey, "key", "", "TLS key file")
+	serveCmd.Flags().BoolVar(&serveInsecure, "insecure", false, "Disable TLS (not recommended for production)")
 }

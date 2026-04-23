@@ -15,6 +15,8 @@ var (
 	scanSecrets   bool
 	scanInjection bool
 	scanStrings   bool
+	scanPatterns  bool
+	scanNetwork   bool
 	scanYara      string
 )
 
@@ -29,15 +31,6 @@ Detects:
   - Suspicious strings (URLs, IPs, commands)
   - YARA rule matches (with --yara flag)
 
-Requires root privileges on macOS.
-
-Examples:
-  # Scan for secrets
-  sudo ads-memory-forensics scan --pid 1234 --secrets
-
-  # Scan for code injection
-  sudo ads-memory-forensics scan --pid 1234 --injection
-
   # Full scan with YARA rules
   sudo ads-memory-forensics scan --pid 1234 --yara rules.yar`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -50,18 +43,22 @@ Examples:
 		}
 
 		opts := memory.ScanOptions{
-			PID:            scanPID,
-			ScanSecrets:    scanSecrets,
-			ScanInjection:  scanInjection,
-			ScanStrings:    scanStrings,
-			YaraRulesPath:  scanYara,
+			PID:           scanPID,
+			ScanSecrets:   scanSecrets,
+			ScanInjection: scanInjection,
+			ScanStrings:   scanStrings,
+			ScanPatterns:  scanPatterns,
+			ScanNetwork:   scanNetwork,
+			YaraRulesPath: scanYara,
 		}
 
 		// If no specific scan type, enable all
-		if !scanSecrets && !scanInjection && !scanStrings && scanYara == "" {
+		if !scanSecrets && !scanInjection && !scanStrings && !scanPatterns && !scanNetwork && scanYara == "" {
 			opts.ScanSecrets = true
 			opts.ScanInjection = true
 			opts.ScanStrings = true
+			opts.ScanPatterns = true
+			opts.ScanNetwork = true
 		}
 
 		result, err := memory.ScanProcess(opts)
@@ -120,6 +117,64 @@ func outputScanResults(result *memory.ScanResult) error {
 		fmt.Println()
 	}
 
+	if len(result.Emails) > 0 {
+		fmt.Println("=== E-mails ===")
+		for _, e := range result.Emails {
+			fmt.Printf("  %s\n", e)
+		}
+		fmt.Println()
+	}
+
+	if len(result.Domains) > 0 {
+		fmt.Println("=== Domains ===")
+		for _, d := range result.Domains {
+			fmt.Printf("  %s\n", d)
+		}
+		fmt.Println()
+	}
+
+	if len(result.IPs) > 0 {
+		fmt.Println("=== IP Addresses ===")
+		for _, ip := range result.IPs {
+			fmt.Printf("  %s\n", ip)
+		}
+		fmt.Println()
+	}
+
+	if len(result.JSONs) > 0 {
+		fmt.Println("=== JSON Structures ===")
+		for _, j := range result.JSONs {
+			if len(j) > 200 {
+				fmt.Printf("  %s...\n", j[:197])
+			} else {
+				fmt.Printf("  %s\n", j)
+			}
+		}
+		fmt.Println()
+	}
+
+	if len(result.Wallets) > 0 {
+		fmt.Println("=== Crypto Wallets ===")
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "TYPE\tADDRESS")
+		for _, wlt := range result.Wallets {
+			fmt.Fprintf(w, "%s\t%s\n", wlt.Type, wlt.Address)
+		}
+		w.Flush()
+		fmt.Println()
+	}
+
+	if len(result.Network) > 0 {
+		fmt.Println("=== Open Connections ===")
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "PROTO\tLOCAL\tREMOTE\tSTATE\tFD")
+		for _, n := range result.Network {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\n", n.Protocol, n.LocalAddr, n.RemoteAddr, n.State, n.FD)
+		}
+		w.Flush()
+		fmt.Println()
+	}
+
 	if len(result.YaraMatches) > 0 {
 		fmt.Println("=== YARA Matches ===")
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
@@ -136,6 +191,12 @@ func outputScanResults(result *memory.ScanResult) error {
 	fmt.Printf("  Secrets: %d\n", len(result.Secrets))
 	fmt.Printf("  Injection indicators: %d\n", len(result.Injections))
 	fmt.Printf("  Suspicious strings: %d\n", len(result.Strings))
+	fmt.Printf("  Emails: %d\n", len(result.Emails))
+	fmt.Printf("  Domains: %d\n", len(result.Domains))
+	fmt.Printf("  IPs: %d\n", len(result.IPs))
+	fmt.Printf("  JSON Objects: %d\n", len(result.JSONs))
+	fmt.Printf("  Wallets: %d\n", len(result.Wallets))
+	fmt.Printf("  Network Connections: %d\n", len(result.Network))
 	fmt.Printf("  YARA matches: %d\n", len(result.YaraMatches))
 
 	if result.ThreatScore > 0 {
@@ -151,5 +212,7 @@ func init() {
 	scanCmd.Flags().BoolVarP(&scanSecrets, "secrets", "s", false, "Scan for credentials and secrets")
 	scanCmd.Flags().BoolVarP(&scanInjection, "injection", "i", false, "Scan for code injection")
 	scanCmd.Flags().BoolVarP(&scanStrings, "strings", "t", false, "Extract suspicious strings")
+	scanCmd.Flags().BoolVarP(&scanPatterns, "patterns", "P", false, "Scan for regex patterns (emails, IPs, etc.)")
+	scanCmd.Flags().BoolVarP(&scanNetwork, "network", "N", false, "Detect open network connections")
 	scanCmd.Flags().StringVarP(&scanYara, "yara", "y", "", "Path to YARA rules file")
 }
