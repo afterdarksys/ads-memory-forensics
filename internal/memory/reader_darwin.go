@@ -5,39 +5,64 @@ package memory
 /*
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <libproc.h>
 #include <stdlib.h>
 
-// Get task port for a process
 kern_return_t get_task_for_pid_wrapper(int pid, mach_port_t *task) {
-    return task_for_pid(mach_task_self(), pid, task);
+	return task_for_pid(mach_task_self(), pid, task);
 }
 
-// Read memory from a task
 kern_return_t read_memory(mach_port_t task, mach_vm_address_t address, mach_vm_size_t size, void *buffer, mach_vm_size_t *bytes_read) {
-    return mach_vm_read_overwrite(task, address, size, (mach_vm_address_t)buffer, bytes_read);
+	return mach_vm_read_overwrite(task, address, size, (mach_vm_address_t)buffer, bytes_read);
 }
 
-// Get region info
 kern_return_t get_region_info(mach_port_t task, mach_vm_address_t *address, mach_vm_size_t *size, vm_region_basic_info_data_64_t *info) {
-    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t object_name;
-    return mach_vm_region(task, address, size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)info, &count, &object_name);
+	mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+	mach_port_t object_name;
+	return mach_vm_region(task, address, size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)info, &count, &object_name);
+}
+
+int get_process_name(int pid, char *buf, int bufsize) {
+	return proc_name(pid, buf, bufsize);
+}
+
+void release_task_port(mach_port_t task) {
+	mach_port_deallocate(mach_task_self(), task);
 }
 */
 import "C"
 
 import (
+	"bytes"
 	"fmt"
+	"log"
+	"os"
+	"sync"
 	"unsafe"
 )
 
-// ListRegions returns all memory regions for a process
+// maxRegionSize caps individual region reads to avoid OOM on pathological mappings.
+const maxRegionSize = 256 * 1024 * 1024 // 256 MB
+
+// poolBufSize is the size of buffers held in bufPool.
+const poolBufSize = 16 * 1024 * 1024 // 16 MB
+
+// bufPool recycles 16 MB read buffers to reduce GC pressure during scanning.
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, poolBufSize)
+		return &b
+	},
+}
+
+// ListRegions returns all memory regions for a process.
 func ListRegions(pid int32) ([]Region, error) {
 	var task C.mach_port_t
 	kr := C.get_task_for_pid_wrapper(C.int(pid), &task)
 	if kr != C.KERN_SUCCESS {
 		return nil, fmt.Errorf("task_for_pid failed: %d (requires root)", kr)
 	}
+	defer C.release_task_port(task) // Bug 1: release send right
 
 	var regions []Region
 	var address C.mach_vm_address_t = 0
@@ -77,27 +102,62 @@ func getRegionType(info C.vm_region_basic_info_data_64_t) string {
 	return "private"
 }
 
-// ReadMemory reads memory from a process
+// processName returns the OS-reported name for pid via proc_name(3).
+func processName(pid int32) string {
+	buf := make([]byte, C.PROC_PIDPATHINFO_MAXSIZE)
+	n := C.get_process_name(C.int(pid), (*C.char)(unsafe.Pointer(&buf[0])), C.int(len(buf)))
+	if n <= 0 {
+		return fmt.Sprintf("pid_%d", pid)
+	}
+	return string(buf[:n])
+}
+
+// ReadMemory reads size bytes from address in pid's address space.
+// For regions ≤ 16 MB it borrows a buffer from bufPool to reduce GC pressure.
 func ReadMemory(pid int32, address uint64, size uint64) ([]byte, error) {
 	var task C.mach_port_t
 	kr := C.get_task_for_pid_wrapper(C.int(pid), &task)
 	if kr != C.KERN_SUCCESS {
 		return nil, fmt.Errorf("task_for_pid failed: %d (requires root)", kr)
 	}
+	defer C.release_task_port(task) // Bug 2: release send right
 
-	buffer := make([]byte, size)
 	var bytesRead C.mach_vm_size_t
 
+	if size <= poolBufSize {
+		bp := bufPool.Get().(*[]byte)
+		defer bufPool.Put(bp)
+		buf := *bp
+
+		kr = C.read_memory(task, C.mach_vm_address_t(address), C.mach_vm_size_t(size),
+			unsafe.Pointer(&buf[0]), &bytesRead)
+		if kr != C.KERN_SUCCESS {
+			return nil, fmt.Errorf("mach_vm_read failed: %d", kr)
+		}
+		if uint64(bytesRead) < size { // Bug 10: warn on partial reads
+			log.Printf("ReadMemory: partial read at 0x%x: got %d of %d bytes", address, bytesRead, size)
+		}
+		// Copy out of pooled buffer before returning it.
+		result := make([]byte, bytesRead)
+		copy(result, buf[:bytesRead])
+		return result, nil
+	}
+
+	// Oversized region: allocate directly.
+	buffer := make([]byte, size)
 	kr = C.read_memory(task, C.mach_vm_address_t(address), C.mach_vm_size_t(size),
 		unsafe.Pointer(&buffer[0]), &bytesRead)
 	if kr != C.KERN_SUCCESS {
 		return nil, fmt.Errorf("mach_vm_read failed: %d", kr)
 	}
-
+	if uint64(bytesRead) < size {
+		log.Printf("ReadMemory: partial read at 0x%x: got %d of %d bytes", address, bytesRead, size)
+	}
 	return buffer[:bytesRead], nil
 }
 
-// DumpProcess dumps all readable memory regions to a file
+// DumpProcess dumps all readable memory regions to outputPath.
+// If outputPath is empty, only statistics are collected.
 func DumpProcess(pid int32, outputPath string, includeAll bool) (*DumpResult, error) {
 	regions, err := ListRegions(pid)
 	if err != nil {
@@ -105,36 +165,48 @@ func DumpProcess(pid int32, outputPath string, includeAll bool) (*DumpResult, er
 	}
 
 	result := &DumpResult{
-		PID:        pid,
-		OutputPath: outputPath,
+		PID:         pid,
+		OutputPath:  outputPath,
+		ProcessName: processName(pid), // Bug 7: use proc_name
 	}
 
-	// Get process name (placeholder - would use proc_name in full impl)
-	result.ProcessName = fmt.Sprintf("pid_%d", pid)
-
-	var totalSize uint64
-	var regionCount int
+	// Bug 9: actually write to file when a path is provided
+	var f *os.File
+	if outputPath != "" {
+		f, err = os.Create(outputPath)
+		if err != nil {
+			return nil, fmt.Errorf("create dump file: %w", err)
+		}
+		defer f.Close()
+	}
 
 	for _, region := range regions {
-		// Skip non-readable unless includeAll
 		if !region.Readable && !includeAll {
 			continue
 		}
+		if region.Size > maxRegionSize { // Bug 8: skip oversized regions
+			continue
+		}
 
-		regionCount++
-		totalSize += region.Size
+		data, err := ReadMemory(pid, region.Start, region.Size)
+		if err != nil {
+			continue
+		}
+
+		if f != nil {
+			if _, err := f.Write(data); err != nil {
+				return nil, fmt.Errorf("write dump: %w", err)
+			}
+		}
+
+		result.RegionCount++
+		result.TotalSize += uint64(len(data))
 	}
-
-	result.RegionCount = regionCount
-	result.TotalSize = totalSize
-
-	// In full implementation, would write to outputPath here
-	// For now, just return the stats
 
 	return result, nil
 }
 
-// ScanProcess scans process memory for artifacts
+// ScanProcess scans process memory for artifacts.
 func ScanProcess(opts ScanOptions) (*ScanResult, error) {
 	regions, err := ListRegions(opts.PID)
 	if err != nil {
@@ -143,58 +215,48 @@ func ScanProcess(opts ScanOptions) (*ScanResult, error) {
 
 	result := &ScanResult{
 		PID:         opts.PID,
-		ProcessName: fmt.Sprintf("pid_%d", opts.PID),
+		ProcessName: processName(opts.PID), // Bug 7: use proc_name
 	}
 
 	for _, region := range regions {
 		if !region.Readable {
 			continue
 		}
+		if region.Size > maxRegionSize { // Bug 8: cap region size
+			continue
+		}
 
 		result.RegionsScanned++
 		result.BytesScanned += region.Size
 
-		// Read region memory
 		data, err := ReadMemory(opts.PID, region.Start, region.Size)
 		if err != nil {
 			continue
 		}
 
-		// Scan for secrets
 		if opts.ScanSecrets {
-			secrets := scanForSecrets(data, region.Start)
-			result.Secrets = append(result.Secrets, secrets...)
+			result.Secrets = append(result.Secrets, scanForSecrets(data, region.Start)...)
 		}
-
-		// Scan for injection
 		if opts.ScanInjection {
-			injections := scanForInjection(data, region)
-			result.Injections = append(result.Injections, injections...)
+			result.Injections = append(result.Injections, scanForInjection(data, region)...)
 		}
-
-		// Extract strings
 		if opts.ScanStrings {
-			strings := extractSuspiciousStrings(data)
-			result.Strings = append(result.Strings, strings...)
+			result.Strings = append(result.Strings, extractSuspiciousStrings(data)...)
 		}
 	}
 
-	// Calculate threat score
 	result.ThreatScore = calculateThreatScore(result)
-
 	return result, nil
 }
 
-// scanForSecrets searches for credentials in memory
 func scanForSecrets(data []byte, baseOffset uint64) []SecretMatch {
 	var matches []SecretMatch
 
-	// Secret patterns to search for
 	patterns := []struct {
-		name    string
-		prefix  []byte
-		minLen  int
-		maxLen  int
+		name   string
+		prefix []byte
+		minLen int
+		maxLen int
 	}{
 		{"aws_access_key", []byte("AKIA"), 20, 20},
 		{"aws_secret_key", []byte("aws_secret_access_key"), 40, 50},
@@ -211,13 +273,12 @@ func scanForSecrets(data []byte, baseOffset uint64) []SecretMatch {
 	for _, p := range patterns {
 		offset := 0
 		for {
-			idx := findBytes(data[offset:], p.prefix)
+			idx := bytes.Index(data[offset:], p.prefix) // Bug 3: use bytes.Index
 			if idx == -1 {
 				break
 			}
 			actualOffset := offset + idx
 
-			// Extract potential secret
 			endOffset := actualOffset + p.maxLen
 			if endOffset > len(data) {
 				endOffset = len(data)
@@ -240,11 +301,9 @@ func scanForSecrets(data []byte, baseOffset uint64) []SecretMatch {
 	return matches
 }
 
-// scanForInjection searches for code injection indicators
 func scanForInjection(data []byte, region Region) []InjectionMatch {
 	var matches []InjectionMatch
 
-	// Look for shellcode patterns
 	shellcodePatterns := []struct {
 		name    string
 		pattern []byte
@@ -257,28 +316,28 @@ func scanForInjection(data []byte, region Region) []InjectionMatch {
 	}
 
 	for _, p := range shellcodePatterns {
-		idx := findBytes(data, p.pattern)
-		if idx != -1 {
-			// Only flag if in executable region or writable+executable
-			if region.Executable || (region.Writable && region.Executable) {
-				matches = append(matches, InjectionMatch{
-					Type:        p.name,
-					Offset:      region.Start + uint64(idx),
-					Size:        len(p.pattern),
-					Description: p.desc,
-				})
-			}
+		idx := bytes.Index(data, p.pattern) // Bug 3: use bytes.Index
+		if idx == -1 {
+			continue
 		}
+		if !region.Executable { // Bug 6: fix redundant condition
+			continue
+		}
+		matches = append(matches, InjectionMatch{
+			Type:        p.name,
+			Offset:      region.Start + uint64(idx),
+			Size:        len(p.pattern),
+			Description: p.desc,
+		})
 	}
 
 	return matches
 }
 
-// extractSuspiciousStrings extracts potentially malicious strings
+// extractSuspiciousStrings finds all occurrences of each pattern, not just the first.
 func extractSuspiciousStrings(data []byte) []string {
 	var suspicious []string
 
-	// Look for URLs, IPs, commands
 	patterns := []string{
 		"http://", "https://",
 		"/bin/sh", "/bin/bash", "cmd.exe", "powershell",
@@ -287,14 +346,20 @@ func extractSuspiciousStrings(data []byte) []string {
 	}
 
 	for _, p := range patterns {
-		idx := findBytes(data, []byte(p))
-		if idx != -1 {
-			// Extract surrounding context
-			start := idx - 10
+		pat := []byte(p)
+		offset := 0
+		for { // Bug 5: loop to find all occurrences, not just first
+			idx := bytes.Index(data[offset:], pat)
+			if idx == -1 {
+				break
+			}
+			absIdx := offset + idx
+
+			start := absIdx - 10
 			if start < 0 {
 				start = 0
 			}
-			end := idx + 100
+			end := absIdx + 100
 			if end > len(data) {
 				end = len(data)
 			}
@@ -303,6 +368,8 @@ func extractSuspiciousStrings(data []byte) []string {
 			if len(str) > 10 {
 				suspicious = append(suspicious, str)
 			}
+
+			offset = absIdx + 1
 		}
 	}
 
@@ -311,44 +378,14 @@ func extractSuspiciousStrings(data []byte) []string {
 
 func calculateThreatScore(result *ScanResult) int {
 	score := 0
-
-	// Secrets found
 	score += len(result.Secrets) * 15
-
-	// Injection indicators
 	score += len(result.Injections) * 25
-
-	// Suspicious strings
 	score += len(result.Strings) * 5
-
-	// YARA matches
 	score += len(result.YaraMatches) * 20
-
 	if score > 100 {
 		score = 100
 	}
-
 	return score
-}
-
-// Helper functions
-func findBytes(data, pattern []byte) int {
-	if len(pattern) == 0 {
-		return 0
-	}
-	for i := 0; i <= len(data)-len(pattern); i++ {
-		match := true
-		for j := 0; j < len(pattern); j++ {
-			if data[i+j] != pattern[j] {
-				match = false
-				break
-			}
-		}
-		if match {
-			return i
-		}
-	}
-	return -1
 }
 
 func extractSecret(data []byte) string {
@@ -363,11 +400,11 @@ func extractSecret(data []byte) string {
 	return string(result)
 }
 
-func maskSecret(s string) string {
+func maskSecret(s string) string { // Bug 4: use **** not ...
 	if len(s) <= 8 {
 		return "****"
 	}
-	return s[:4] + "..." + s[len(s)-4:]
+	return s[:4] + "****" + s[len(s)-4:]
 }
 
 func extractPrintableString(data []byte) string {
