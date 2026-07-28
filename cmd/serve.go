@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/afterdarksystems/ads-memory-forensics/internal/memory"
@@ -13,6 +15,7 @@ import (
 )
 
 var servePort int
+var serveToken string
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -30,6 +33,13 @@ Requires root privileges for scan and dump operations.
 
 This mode is used by the ADS Security Console GUI.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if serveToken == "" {
+			serveToken = os.Getenv("ADS_MEMORY_FORENSICS_API_TOKEN")
+		}
+		if strings.TrimSpace(serveToken) == "" {
+			return fmt.Errorf("API token is required; set --token or ADS_MEMORY_FORENSICS_API_TOKEN")
+		}
+		serveToken = strings.TrimSpace(serveToken)
 		mux := http.NewServeMux()
 
 		// Health check
@@ -133,11 +143,28 @@ This mode is used by the ADS Security Console GUI.`,
 			fmt.Println("WARNING: Not running as root - scan/dump operations will fail")
 		}
 
-		return http.ListenAndServe(addr, mux)
+		return http.ListenAndServe(addr, requireToken(mux, serveToken))
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(serveCmd)
 	serveCmd.Flags().IntVarP(&servePort, "port", "p", 9002, "Port to listen on")
+	serveCmd.Flags().StringVar(&serveToken, "token", "", "Bearer token required for sensitive API endpoints")
+}
+
+func requireToken(next http.Handler, expected string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" || r.URL.Path == "/info" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		provided := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if len(provided) <= len(prefix) || provided[:len(prefix)] != prefix || subtle.ConstantTimeCompare([]byte(provided[len(prefix):]), []byte(expected)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
