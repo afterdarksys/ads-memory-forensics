@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"text/tabwriter"
 
 	"github.com/afterdarksystems/ads-memory-forensics/internal/memory"
@@ -38,7 +39,7 @@ Detects:
 			return fmt.Errorf("--pid is required")
 		}
 
-		if os.Geteuid() != 0 {
+		if runtime.GOOS != "windows" && os.Geteuid() != 0 {
 			return fmt.Errorf("root privileges required for memory scan")
 		}
 
@@ -214,5 +215,5 @@ func init() {
 	scanCmd.Flags().BoolVarP(&scanStrings, "strings", "t", false, "Extract suspicious strings")
 	scanCmd.Flags().BoolVarP(&scanPatterns, "patterns", "P", false, "Scan for regex patterns (emails, IPs, etc.)")
 	scanCmd.Flags().BoolVarP(&scanNetwork, "network", "N", false, "Detect open network connections")
-	scanCmd.Flags().StringVarP(&scanYara, "yara", "y", "", "Path to YARA rules file")
+	scanCmd.Flags().StringVarP(&scanYara, "yara", "y", "", "YARA source file or builtin (requires yara and yarac on PATH)")
 }

@@ -76,6 +76,15 @@ func DumpProcess(pid int32, outputPath string, includeAll bool) (*DumpResult, er
 
 // ScanProcess scans process memory for artifacts.
 func ScanProcess(opts ScanOptions) (*ScanResult, error) {
+	var yara *yaraScanner
+	if opts.YaraRulesPath != "" {
+		var err error
+		yara, err = newYaraScanner(opts.YaraRulesPath)
+		if err != nil {
+			return nil, err
+		}
+		defer yara.close()
+	}
 	regions, err := ListRegions(opts.PID)
 	if err != nil {
 		return nil, err
@@ -99,6 +108,13 @@ func ScanProcess(opts ScanOptions) (*ScanResult, error) {
 
 		result.RegionsScanned++
 		result.BytesScanned += uint64(len(data))
+		if yara != nil {
+			matches, err := yara.scan(data, region.Start)
+			if err != nil {
+				return nil, fmt.Errorf("YARA region 0x%x: %w", region.Start, err)
+			}
+			result.YaraMatches = append(result.YaraMatches, matches...)
+		}
 
 		// Scan for secrets
 		if opts.ScanSecrets {

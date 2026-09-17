@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 
 	"github.com/afterdarksystems/ads-memory-forensics/internal/memory"
 	"github.com/spf13/cobra"
@@ -33,7 +34,7 @@ Examples:
 			return fmt.Errorf("--pid is required")
 		}
 
-		if os.Geteuid() != 0 {
+		if runtime.GOOS != "windows" && os.Geteuid() != 0 {
 			return fmt.Errorf("root privileges required for memory dump")
 		}
 
