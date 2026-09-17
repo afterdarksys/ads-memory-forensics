@@ -2,12 +2,14 @@ package cmd
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/afterdarksystems/ads-memory-forensics/internal/memory"
@@ -24,7 +26,7 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 			return
 		}
 		auth := r.Header.Get("Authorization")
-		if auth != "Bearer "+token {
+		if subtle.ConstantTimeCompare([]byte(auth), []byte("Bearer "+token)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -33,9 +35,10 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 }
 
 var (
-	servePort    int
-	serveCert    string
-	serveKey     string
+	serveToken    string
+	servePort     int
+	serveCert     string
+	serveKey      string
 	serveInsecure bool
 )
 
@@ -56,7 +59,13 @@ Requires root privileges for scan and dump operations.
 This mode is used by the ADS Security Console GUI.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Resolve API token: env var takes precedence, else generate random one.
-		apiToken := os.Getenv("ADS_MEMORY_API_TOKEN")
+		apiToken := strings.TrimSpace(serveToken)
+		if apiToken == "" {
+			apiToken = strings.TrimSpace(os.Getenv("ADS_MEMORY_FORENSICS_API_TOKEN"))
+		}
+		if apiToken == "" {
+			apiToken = strings.TrimSpace(os.Getenv("ADS_MEMORY_API_TOKEN"))
+		}
 		if apiToken == "" {
 			buf := make([]byte, 16)
 			if _, err := rand.Read(buf); err != nil {
@@ -211,6 +220,7 @@ This mode is used by the ADS Security Console GUI.`,
 
 func init() {
 	rootCmd.AddCommand(serveCmd)
+	serveCmd.Flags().StringVar(&serveToken, "token", "", "Bearer token required for sensitive API endpoints")
 	serveCmd.Flags().IntVarP(&servePort, "port", "p", 9002, "Port to listen on")
 	serveCmd.Flags().StringVar(&serveCert, "cert", "", "TLS certificate file")
 	serveCmd.Flags().StringVar(&serveKey, "key", "", "TLS key file")

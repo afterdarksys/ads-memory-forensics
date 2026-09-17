@@ -1,12 +1,16 @@
 package memory
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"regexp"
 	"unicode"
 )
+
+const maxRegionSize = 256 * 1024 * 1024
 
 var (
 	emailRegex     = regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
@@ -29,36 +33,48 @@ func DumpProcess(pid int32, outputPath string, includeAll bool) (*DumpResult, er
 	}
 
 	result := &DumpResult{
-		PID:        pid,
-		OutputPath: outputPath,
+		PID:         pid,
+		OutputPath:  outputPath,
+		ProcessName: processName(pid), // Bug 7: use proc_name
 	}
 
-	// Get process name (placeholder - would use proc_name in full impl)
-	result.ProcessName = fmt.Sprintf("pid_%d", pid)
-
-	var totalSize uint64
-	var regionCount int
+	// Bug 9: actually write to file when a path is provided
+	var f *os.File
+	if outputPath != "" {
+		f, err = os.OpenFile(outputPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("create dump file: %w", err)
+		}
+		defer f.Close()
+	}
 
 	for _, region := range regions {
-		// Skip non-readable unless includeAll
 		if !region.Readable && !includeAll {
 			continue
 		}
+		if region.Size > maxRegionSize { // Bug 8: skip oversized regions
+			continue
+		}
 
-		regionCount++
-		totalSize += region.Size
+		data, err := ReadMemory(pid, region.Start, region.Size)
+		if err != nil {
+			continue
+		}
+
+		if f != nil {
+			if _, err := f.Write(data); err != nil {
+				return nil, fmt.Errorf("write dump: %w", err)
+			}
+		}
+
+		result.RegionCount++
+		result.TotalSize += uint64(len(data))
 	}
-
-	result.RegionCount = regionCount
-	result.TotalSize = totalSize
-
-	// In full implementation, would write to outputPath here
-	// For now, just return the stats
 
 	return result, nil
 }
 
-// ScanProcess scans process memory for artifacts
+// ScanProcess scans process memory for artifacts.
 func ScanProcess(opts ScanOptions) (*ScanResult, error) {
 	regions, err := ListRegions(opts.PID)
 	if err != nil {
@@ -67,22 +83,22 @@ func ScanProcess(opts ScanOptions) (*ScanResult, error) {
 
 	result := &ScanResult{
 		PID:         opts.PID,
-		ProcessName: fmt.Sprintf("pid_%d", opts.PID),
+		ProcessName: processName(opts.PID),
 	}
 
 	for _, region := range regions {
-		if !region.Readable {
+		if !region.Readable || region.Size > maxRegionSize {
 			continue
 		}
-
-		result.RegionsScanned++
-		result.BytesScanned += region.Size
 
 		// Read region memory
 		data, err := ReadMemory(opts.PID, region.Start, region.Size)
 		if err != nil {
 			continue
 		}
+
+		result.RegionsScanned++
+		result.BytesScanned += uint64(len(data))
 
 		// Scan for secrets
 		if opts.ScanSecrets {
@@ -142,7 +158,6 @@ func ScanProcess(opts ScanOptions) (*ScanResult, error) {
 func scanForSecrets(data []byte, baseOffset uint64) []SecretMatch {
 	var matches []SecretMatch
 
-	// Secret patterns to search for
 	patterns := []struct {
 		name   string
 		prefix []byte
@@ -164,13 +179,12 @@ func scanForSecrets(data []byte, baseOffset uint64) []SecretMatch {
 	for _, p := range patterns {
 		offset := 0
 		for {
-			idx := findBytes(data[offset:], p.prefix)
+			idx := bytes.Index(data[offset:], p.prefix) // Bug 3: use bytes.Index
 			if idx == -1 {
 				break
 			}
 			actualOffset := offset + idx
 
-			// Extract potential secret
 			endOffset := actualOffset + p.maxLen
 			if endOffset > len(data) {
 				endOffset = len(data)
@@ -193,11 +207,9 @@ func scanForSecrets(data []byte, baseOffset uint64) []SecretMatch {
 	return matches
 }
 
-// scanForInjection searches for code injection indicators
 func scanForInjection(data []byte, region Region) []InjectionMatch {
 	var matches []InjectionMatch
 
-	// Look for shellcode patterns
 	shellcodePatterns := []struct {
 		name    string
 		pattern []byte
@@ -210,28 +222,28 @@ func scanForInjection(data []byte, region Region) []InjectionMatch {
 	}
 
 	for _, p := range shellcodePatterns {
-		idx := findBytes(data, p.pattern)
-		if idx != -1 {
-			// Only flag if in executable region or writable+executable
-			if region.Executable || (region.Writable && region.Executable) {
-				matches = append(matches, InjectionMatch{
-					Type:        p.name,
-					Offset:      region.Start + uint64(idx),
-					Size:        len(p.pattern),
-					Description: p.desc,
-				})
-			}
+		idx := bytes.Index(data, p.pattern) // Bug 3: use bytes.Index
+		if idx == -1 {
+			continue
 		}
+		if !region.Executable { // Bug 6: fix redundant condition
+			continue
+		}
+		matches = append(matches, InjectionMatch{
+			Type:        p.name,
+			Offset:      region.Start + uint64(idx),
+			Size:        len(p.pattern),
+			Description: p.desc,
+		})
 	}
 
 	return matches
 }
 
-// extractSuspiciousStrings extracts potentially malicious strings
+// extractSuspiciousStrings finds all occurrences of each pattern, not just the first.
 func extractSuspiciousStrings(data []byte) []string {
 	var suspicious []string
 
-	// Look for URLs, IPs, commands
 	patterns := []string{
 		"http://", "https://",
 		"/bin/sh", "/bin/bash", "cmd.exe", "powershell",
@@ -240,14 +252,17 @@ func extractSuspiciousStrings(data []byte) []string {
 	}
 
 	for _, p := range patterns {
-		idx := findBytes(data, []byte(p))
-		if idx != -1 {
-			// Extract surrounding context
-			start := idx - 10
-			if start < 0 {
-				start = 0
+		pat := []byte(p)
+		offset := 0
+		for { // Bug 5: loop to find all occurrences, not just first
+			idx := bytes.Index(data[offset:], pat)
+			if idx == -1 {
+				break
 			}
-			end := idx + 100
+			absIdx := offset + idx
+
+			start := absIdx
+			end := absIdx + 100
 			if end > len(data) {
 				end = len(data)
 			}
@@ -256,13 +271,14 @@ func extractSuspiciousStrings(data []byte) []string {
 			if len(str) > 10 {
 				suspicious = append(suspicious, str)
 			}
+
+			offset = absIdx + 1
 		}
 	}
 
 	return suspicious
 }
 
-// scanForPatterns extracts regex based artifacts
 func scanForPatterns(data []byte, baseOffset uint64) (emails []string, domains []string, ips []string, wallets []WalletMatch, secrets []SecretMatch) {
 	// Emails
 	emailMatches := emailRegex.FindAll(data, -1)
@@ -501,11 +517,11 @@ func extractSecret(data []byte) string {
 	return string(result)
 }
 
-func maskSecret(s string) string {
+func maskSecret(s string) string { // Bug 4: use **** not ...
 	if len(s) <= 8 {
 		return "****"
 	}
-	return s[:4] + "..." + s[len(s)-4:]
+	return s[:4] + "****" + s[len(s)-4:]
 }
 
 func extractPrintableString(data []byte) string {
